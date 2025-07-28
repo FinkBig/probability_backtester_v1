@@ -59,7 +59,7 @@ def make_api_request_with_retry(url: str, params: dict) -> dict:
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             logger.warning(f"Network/Timeout error (Attempt {attempt+1}): {e}.")
         except requests.exceptions.RequestException as e:
-            logger.warning(f"Request failed (Attempt (attempt+1): {e}.")
+            logger.warning(f"Request failed (Attempt {attempt+1}): {e}.")
         if attempt + 1 < API_RETRY_ATTEMPTS:
             wait_time = API_RETRY_WAIT_S * (2 ** attempt)
             logger.info(f"Retrying in {wait_time:.1f}s...")
@@ -311,6 +311,11 @@ def run_arb_backtest(df_merged, df_underlying, higher_strike, expiry_ts, lower_s
         min_pnl = df_trades['pnl'].min()
         avg_div = df_trades['divergence'].mean()
         drv_rewards = DRV_REWARD_RATE * total_spread_spend
+        total_capital_at_risk = df_trades['total_cost'].sum()
+        peak_pnl = max(pnl_list) if pnl_list else 0
+        max_drawdown = min(0, min(pnl_list) - peak_pnl) if pnl_list else 0
+        pnl_std = df_trades['pnl'].std() if len(df_trades) > 1 else 1  # Avoid division by zero
+        sharpe_ratio = avg_pnl / pnl_std if pnl_std != 0 else 0  # Sharpe, assuming risk-free rate ~0
         print("\n\n")
         print("Backtest Summary")
         print("===============")
@@ -322,6 +327,9 @@ def run_arb_backtest(df_merged, df_underlying, higher_strike, expiry_ts, lower_s
         print(f"Min PnL:           {min_pnl:.2f} USD")
         print(f"Avg Divergence:    {avg_div:.2f}")
         print(f"DRV Rewards:       {drv_rewards:.2f} USD (12% on spread spend, not in PnL)")
+        print(f"Total Capital at Risk: {total_capital_at_risk:.2f} USD")
+        print(f"Max Drawdown:      {max_drawdown:.2f} USD")
+        print(f"Sharpe Ratio:      {sharpe_ratio:.2f}")
         print("\n\n")
 
 def run_backtest(asset: str, strike: float, poly_csv_path: str, lower_strike: float, mode='barrier', threshold=DIV_THRESHOLD, fees=FEES):
