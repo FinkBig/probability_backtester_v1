@@ -11,6 +11,7 @@ import time
 import calendar
 import re
 import ccxt
+import argparse
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -25,9 +26,10 @@ REQUEST_DELAY_S = 0.25
 TRADES_COUNT_LIMIT = 10000
 BASE_DIR = 'prob_comparison'
 POLYMARKET_DATA_DIR = 'Polymarket_data'
-MIN_TRADES = 50  # Minimum trades threshold
+MIN_DATA_POINTS = 2  # Minimum rows for valid CSV/plot
 MIN_IV = 1.0  # Minimum IV (1%)
 MAX_IV = 500.0  # Maximum IV (500%)
+RESOLUTION_THRESHOLD = 0.99  # Polymarket resolution threshold (99%)
 
 class DeribitApiError(Exception):
     def __init__(self, message, code=None):
@@ -119,7 +121,7 @@ def fetch_underlying_historical(asset: str, start_ts_ms: int, end_ts_ms: int) ->
             current = ohlcv[-1][0] + 3600 * 1000
             time.sleep(0.1)
         except Exception as e:
-            logger.error(f"Failed to fetch Binance data: {e}")
+            logger.error(f"Failed to fetch Binance data for {asset}: {e}")
             break
     if klines:
         df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -138,7 +140,9 @@ def infer_poly_expiry(poly_csv_path: str, df_poly: pd.DataFrame) -> datetime:
     month_num = month_map.get(month_str, df_poly['timestamp'].dt.month.max())
     year = df_poly['timestamp'].dt.year.max()
     last_day = calendar.monthrange(year, month_num)[1]
-    return datetime(year, month_num, last_day, DERIBIT_EXPIRY_HOUR_UTC, tzinfo=timezone.utc)
+    expiry_dt = datetime(year, month_num, last_day, DERIBIT_EXPIRY_HOUR_UTC, tzinfo=timezone.utc)
+    logger.info(f"Inferred expiry for {poly_csv_path}: {expiry_dt}")
+    return expiry_dt
 
 def find_nearest_deribit_expiry(asset: str, target_date: datetime) -> str:
     endpoint = f"{HISTORY_DERIBIT_API_URL}/public/get_instruments"
@@ -147,19 +151,29 @@ def find_nearest_deribit_expiry(asset: str, target_date: datetime) -> str:
     expiries = set(inst['instrument_name'].split('-')[1] for inst in data['result'])
     sorted_expiries = sorted(expiries, key=lambda x: datetime.strptime(x, '%d%b%y'))
     monthly_expiries = [exp for exp in sorted_expiries if is_monthly_expiry(exp)]
+    if not monthly_expiries:
+        logger.error(f"No monthly expiries found for {asset}")
+        return None
     diffs = [abs(datetime.strptime(exp, '%d%b%y').replace(tzinfo=timezone.utc) - target_date) for exp in monthly_expiries]
     min_index = np.argmin(diffs)
+    logger.info(f"Nearest Deribit expiry for {asset} on {target_date}: {monthly_expiries[min_index]}")
     return monthly_expiries[min_index]
 
 def is_monthly_expiry(expiry_str: str):
-    expiry_date = datetime.strptime(expiry_str, '%d%b%y')
-    month_end = datetime(expiry_date.year, expiry_date.month, calendar.monthrange(expiry_date.year, expiry_date.month)[1])
-    last_friday = month_end - timedelta(days=(month_end.weekday() - 4) % 7)
-    return expiry_date.date() == last_friday.date()
+    try:
+        expiry_date = datetime.strptime(expiry_str, '%d%b%y')
+        month_end = datetime(expiry_date.year, expiry_date.month, calendar.monthrange(expiry_date.year, expiry_date.month)[1])
+        last_friday = month_end - timedelta(days=(month_end.weekday() - 4) % 7)
+        return expiry_date.date() == last_friday.date()
+    except ValueError:
+        return False
 
 def get_deribit_strikes(asset: str, expiry_str: str) -> dict:
+    if not expiry_str:
+        logger.error(f"No valid expiry string provided for {asset}")
+        return {}
     instruments = make_api_request_with_retry(f"{HISTORY_DERIBIT_API_URL}/public/get_instruments", {'currency': asset, 'kind': 'option', 'expired': 'true'})['result']
-    expiry_fmt = datetime.strptime(expiry_str, '%d%b%y').strftime('%d%b%y').upper().lstrip('0').replace('0', '')
+    expiry_fmt = datetime.strptime(expiry_str, '%d%b%y').strftime('%d%b%y').upper().lstrip('0')
     strike_to_instr = {}
     for inst in instruments:
         if expiry_fmt in inst['instrument_name']:
@@ -168,6 +182,7 @@ def get_deribit_strikes(asset: str, expiry_str: str) -> dict:
             if strike not in strike_to_instr:
                 strike_to_instr[strike] = {}
             strike_to_instr[strike][opt_type] = inst['instrument_name']
+    logger.info(f"Found {len(strike_to_instr)} strikes for {asset} with expiry {expiry_str}: {sorted(strike_to_instr.keys())}")
     return strike_to_instr
 
 def fetch_or_load_deribit_trades(instrument_name: str, start_ms: int, end_ms: int, cache_dir) -> pd.DataFrame:
@@ -210,15 +225,16 @@ def prob_hit_lower(F: np.ndarray, L: float, T: np.ndarray, sigma: np.ndarray, r:
     result[valid] = np.clip(p, 0, 1)
     return result
 
-def compute_barrier_probabilities(df_hour, strike, poly_end_ts, option_type, r=0.0, q=0.0):
+def compute_barrier_probabilities(df_hour, strike, expiry_ts, option_type, r=0.0, q=0.0):
     df_opt = df_hour.copy()
-    df_opt = df_opt.dropna(subset=['iv'])  # Drop rows with missing IV
-    df_opt = df_opt[(df_opt['iv'] >= MIN_IV) & (df_opt['iv'] <= MAX_IV)]  # Filter IV range
+    df_opt = df_opt[df_opt['unix_sec'] <= expiry_ts]
+    df_opt = df_opt.dropna(subset=['iv'])
+    df_opt = df_opt[(df_opt['iv'] >= MIN_IV) & (df_opt['iv'] <= MAX_IV)]
     if df_opt.empty:
         logger.warning(f"No valid IV data for strike {strike} after filtering")
         return None
-    df_opt['F'] = df_opt['index_price'].ffill().bfill()
-    df_opt['T'] = (poly_end_ts - df_opt['unix_sec']) / (365.25 * 86400)
+    df_opt['F'] = df_opt['close'].ffill().bfill()
+    df_opt['T'] = (expiry_ts - df_opt['unix_sec']) / (365.25 * 86400)
     df_opt['T'] = df_opt['T'].clip(lower=1e-6)
     sigma = df_opt['iv'] / 100
     if option_type == 'call':
@@ -227,56 +243,169 @@ def compute_barrier_probabilities(df_hour, strike, poly_end_ts, option_type, r=0
         df_opt['barrier_prob'] = prob_hit_lower(df_opt['F'].values, strike, df_opt['T'].values, sigma.values, r, q)
     return df_opt
 
-def process_strike(strike, df_poly, expiry_ts, strike_to_instr, start_ms, end_ms, poly_end_ts, spot_median, min_trades, trade_dir):
-    option_type = 'put' if strike < spot_median else 'call'
-    if strike not in strike_to_instr or option_type not in strike_to_instr[strike]:
-        logger.error(f"Instrument not found for strike {strike} ({option_type})")
+def determine_option_type(df_merged_initial, strike, df_underlying):
+    first_ts = df_merged_initial['unix_sec'].min()
+    df_underlying_sorted = df_underlying.sort_values('unix_sec')
+    idx = np.searchsorted(df_underlying_sorted['unix_sec'], first_ts)
+    if idx == 0:
+        initial_spot = df_underlying_sorted.iloc[0]['close']
+    elif idx == len(df_underlying_sorted):
+        initial_spot = df_underlying_sorted.iloc[-1]['close']
+    else:
+        prev = df_underlying_sorted.iloc[idx - 1]
+        next_ = df_underlying_sorted.iloc[idx]
+        if abs(first_ts - prev['unix_sec']) < abs(next_['unix_sec'] - first_ts):
+            initial_spot = prev['close']
+        else:
+            initial_spot = next_['close']
+    option_type = 'call' if strike > initial_spot else 'put'
+    logger.info(f"For strike {strike}, initial spot {initial_spot} at ts {first_ts}, using {option_type}")
+    return option_type
+
+def find_closest_strike(target_strike, available_strikes):
+    if not available_strikes:
         return None
-    instr = strike_to_instr[strike][option_type]
-    df_trades = fetch_or_load_deribit_trades(instr, start_ms, end_ms, trade_dir)
+    available_strikes = sorted(available_strikes)
+    idx = np.searchsorted(available_strikes, target_strike)
+    if idx == 0:
+        return available_strikes[0]
+    if idx == len(available_strikes):
+        return available_strikes[-1]
+    left = available_strikes[idx - 1]
+    right = available_strikes[idx]
+    return left if (target_strike - left) < (right - target_strike) else right
+
+def process_strike(strike, df_poly, expiry_ts, strike_to_instr, start_ms, end_ms, min_trades, trade_dir, strike_columns, expiry_dt_deribit, df_underlying):
+    # Get Polymarket data for this strike
+    df_poly_strike = df_poly[['unix_sec', 'timestamp', strike_columns[strike]]].dropna(subset=[strike_columns[strike]])
+    if df_poly_strike.empty:
+        logger.warning(f"No Polymarket data for strike {strike}, skipping")
+        return None
+    
+    # Find when data first becomes available (not empty/null)
+    first_valid_idx = df_poly_strike[strike_columns[strike]].notna().idxmax()
+    if pd.isna(first_valid_idx):
+        logger.warning(f"No valid Polymarket data for strike {strike}, skipping")
+        return None
+    
+    # Start from when data becomes available
+    df_poly_strike = df_poly_strike.loc[first_valid_idx:].copy()
+    logger.info(f"Polymarket data for strike {strike} starts at {df_poly_strike.iloc[0]['timestamp']}")
+    
+    # Check for resolution (above 99% threshold)
+    resolution_mask = df_poly_strike[strike_columns[strike]] >= RESOLUTION_THRESHOLD
+    if resolution_mask.any():
+        resolution_idx = resolution_mask.idxmax()
+        if resolution_idx > df_poly_strike.index[0]:  # Only if resolution happens after data starts
+            resolution_ts = df_poly_strike.loc[resolution_idx, 'unix_sec']
+            df_poly_strike = df_poly_strike[df_poly_strike['unix_sec'] <= resolution_ts]
+            logger.info(f"Resolution detected for Polymarket strike {strike} at {df_poly_strike.loc[resolution_idx, 'timestamp']}. Data points after filter: {len(df_poly_strike)}")
+    
+    if len(df_poly_strike) < MIN_DATA_POINTS:
+        logger.warning(f"Insufficient Polymarket data points ({len(df_poly_strike)}) for strike {strike}, skipping")
+        return None
+
+    available_strikes = list(strike_to_instr.keys())
+    if not available_strikes:
+        logger.error(f"No strikes available for Deribit instruments")
+        return None
+    if strike not in available_strikes:
+        closest_strike = find_closest_strike(strike, available_strikes)
+        if closest_strike is None:
+            logger.error(f"No suitable strike found for {strike}")
+            return None
+        logger.warning(f"Exact strike {strike} not found on Deribit. Using closest: {closest_strike}")
+        strike = closest_strike
+
+    for temp_type in ['call', 'put']:
+        if strike in strike_to_instr and temp_type in strike_to_instr[strike]:
+            instr = strike_to_instr[strike][temp_type]
+            df_trades_temp = fetch_or_load_deribit_trades(instr, start_ms, end_ms, trade_dir)
+            if not df_trades_temp.empty:
+                break
+    else:
+        logger.error(f"No instrument found for strike {strike}")
+        return None
+
+    # Cut off options data at expiry
+    df_trades = df_trades_temp[df_trades_temp['unix_sec'] <= expiry_ts]
     if len(df_trades) < min_trades:
         logger.warning(f"Insufficient trades ({len(df_trades)}) for {instr}, skipping")
         return None
     df_trades['dt'] = pd.to_datetime(df_trades['unix_sec'], unit='s', utc=True)
     df_hour = df_trades.groupby(pd.Grouper(key='dt', freq='1h')).agg({'price': 'last', 'iv': 'mean', 'index_price': 'last'})
     min_dt = df_poly['timestamp'].min().floor('h')
-    max_dt = df_poly['timestamp'].max().ceil('h')
+    max_dt = min(df_poly['timestamp'].max().ceil('h'), pd.Timestamp(expiry_dt_deribit).ceil('h'))
     full_index = pd.date_range(start=min_dt, end=max_dt, freq='1h')
     df_hour = df_hour.reindex(full_index).ffill().bfill()
     df_hour['unix_sec'] = (df_hour.index.astype('int64') // 10**9).astype('float64')
     df_hour = df_hour.reset_index().rename(columns={'index': 'dt'})
-    df_opt = compute_barrier_probabilities(df_hour, strike, poly_end_ts, option_type)
+
+    df_merged_temp = pd.merge_asof(df_poly_strike, 
+                                   df_hour[['unix_sec', 'iv']], 
+                                   on='unix_sec', direction='nearest')
+    df_merged_temp = df_merged_temp.dropna(subset=['iv'])
+    if df_merged_temp.empty:
+        logger.warning(f"No overlapping data for strike {strike}")
+        return None
+
+    option_type = determine_option_type(df_merged_temp, strike, df_underlying)
+
+    correct_instr = strike_to_instr.get(strike, {}).get(option_type)
+    if not correct_instr:
+        logger.error(f"No {option_type} instrument for strike {strike}")
+        return None
+    if correct_instr != instr:
+        df_trades = fetch_or_load_deribit_trades(correct_instr, start_ms, end_ms, trade_dir)
+        # Cut off options data at expiry
+        df_trades = df_trades[df_trades['unix_sec'] <= expiry_ts]
+        if len(df_trades) < min_trades:
+            logger.warning(f"Insufficient trades ({len(df_trades)}) for {correct_instr}, skipping")
+            return None
+        df_trades['dt'] = pd.to_datetime(df_trades['unix_sec'], unit='s', utc=True)
+        df_hour = df_trades.groupby(pd.Grouper(key='dt', freq='1h')).agg({'price': 'last', 'iv': 'mean', 'index_price': 'last'})
+        df_hour = df_hour.reindex(full_index).ffill().bfill()
+        df_hour['unix_sec'] = (df_hour.index.astype('int64') // 10**9).astype('float64')
+        df_hour = df_hour.reset_index().rename(columns={'index': 'dt'})
+
+    df_hour = pd.merge_asof(df_hour, df_underlying[['unix_sec', 'close']], on='unix_sec', direction='nearest')
+    df_opt = compute_barrier_probabilities(df_hour, strike, expiry_ts, option_type)
     if df_opt is None or df_opt.empty:
         logger.warning(f"No valid probability data for strike {strike}")
         return None
-    df_merged = pd.merge_asof(df_poly[['unix_sec', 'timestamp', f'{int(strike/1000)}k']], 
+
+    df_merged = pd.merge_asof(df_poly_strike, 
                               df_opt[['unix_sec', 'barrier_prob', 'F']], 
                               on='unix_sec', direction='nearest')
-    df_merged = df_merged.rename(columns={f'{int(strike/1000)}k': 'poly_prob'})
+    df_merged = df_merged.rename(columns={strike_columns[strike]: 'poly_prob'})
     df_merged['divergence'] = df_merged['poly_prob'] - df_merged['barrier_prob']
+    df_merged = df_merged[df_merged['unix_sec'] <= expiry_ts]
+    if len(df_merged) < MIN_DATA_POINTS:
+        logger.warning(f"Insufficient merged data points ({len(df_merged)}) for strike {strike}, skipping save and plot")
+        return None
     return df_merged
 
-def main(asset='BTC', min_trades=MIN_TRADES):
-    # List CSV files in Polymarket_data directory
+def main(asset='BTC', min_trades=20):
+    # List all CSV files in Polymarket_data directory
     csv_files = glob.glob(os.path.join(POLYMARKET_DATA_DIR, "*.csv"))
     if not csv_files:
         logger.error(f"No CSV files found in {POLYMARKET_DATA_DIR}")
-        poly_csv_path = os.path.join(POLYMARKET_DATA_DIR, 'btc_june_all_strikes.csv')
-    else:
-        print("Available Polymarket CSV files:")
-        for i, csv_file in enumerate(csv_files):
-            print(f"{i}: {os.path.basename(csv_file)}")
-        try:
-            choice = input(f"Select a CSV file by index (0-{len(csv_files)-1}, default 0): ") or "0"
-            choice_idx = int(choice)
-            if 0 <= choice_idx < len(csv_files):
-                poly_csv_path = csv_files[choice_idx]
-            else:
-                logger.warning("Invalid index, using default CSV")
-                poly_csv_path = os.path.join(POLYMARKET_DATA_DIR, 'btc_june_all_strikes.csv')
-        except (ValueError, IndexError):
-            logger.warning("Invalid input, using default CSV")
-            poly_csv_path = os.path.join(POLYMARKET_DATA_DIR, 'btc_june_all_strikes.csv')
+        return
+    
+    print("Available Polymarket CSV files:")
+    for i, csv_file in enumerate(csv_files):
+        print(f"{i}: {os.path.basename(csv_file)}")
+    try:
+        choice = input(f"Select a CSV file by index (0-{len(csv_files)-1}, default 0): ") or "0"
+        choice_idx = int(choice)
+        if 0 <= choice_idx < len(csv_files):
+            poly_csv_path = csv_files[choice_idx]
+        else:
+            logger.warning("Invalid index, using default CSV")
+            poly_csv_path = csv_files[0]
+    except (ValueError, IndexError):
+        logger.warning("Invalid input, using default CSV")
+        poly_csv_path = csv_files[0]
     
     try:
         df_poly = pd.read_csv(poly_csv_path)
@@ -284,78 +413,126 @@ def main(asset='BTC', min_trades=MIN_TRADES):
         logger.error(f"CSV file {poly_csv_path} not found")
         return
     
+    # Infer asset from CSV filename
+    csv_filename = os.path.basename(poly_csv_path).lower()
+    if csv_filename.startswith('btc'):
+        inferred_asset = 'BTC'
+    elif csv_filename.startswith('eth'):
+        inferred_asset = 'ETH'
+    else:
+        # Try to extract asset from filename pattern
+        asset_match = re.search(r'^([a-zA-Z]+)', csv_filename)
+        if asset_match:
+            inferred_asset = asset_match.group(1).upper()
+        else:
+            logger.warning(f"Could not infer asset from filename {csv_filename}, using default: {asset}")
+            inferred_asset = asset
+    
+    logger.info(f"Inferred asset '{inferred_asset}' from CSV filename: {csv_filename}")
+    asset = inferred_asset
+    
+    strike_columns = {}
+    for col in df_poly.columns:
+        col_clean = col.strip('↑↓$ ')
+        if col_clean.endswith('k') or col_clean.isdigit():
+            num_str = re.sub(r'\D', '', col_clean)
+            if col_clean.endswith('k'):
+                strike_val = float(num_str) * 1000
+            else:
+                strike_val = float(num_str)
+            strike_columns[strike_val] = col
+            logger.info(f"Mapped strike {strike_val} to column '{col}'")
+    
+    if not strike_columns:
+        logger.error("No valid strike columns found in CSV")
+        return
+    
     base = os.path.basename(poly_csv_path).lower().replace('.csv', '')
     parts = base.split('_')
     month_str = parts[1].lower() if len(parts) > 1 else 'unknown'
     
     asset_dir = os.path.join(BASE_DIR, f'{asset}_{month_str}')
-    trade_dir = os.path.join(asset_dir, 'trade_data')
-    prob_dir = os.path.join(asset_dir, 'barrier_prob_data')
-    chart_dir = os.path.join(asset_dir, 'charts')
+    trade_dir = os.path.join(BASE_DIR, f'{asset}_{month_str}', 'trade_data')
+    prob_dir = os.path.join(BASE_DIR, f'{asset}_{month_str}', 'barrier_prob_data')
+    chart_dir = os.path.join(BASE_DIR, f'{asset}_{month_str}', 'charts')
     os.makedirs(trade_dir, exist_ok=True)
     os.makedirs(prob_dir, exist_ok=True)
     os.makedirs(chart_dir, exist_ok=True)
     
-    df_poly['timestamp'] = pd.to_datetime(df_poly['Date (UTC)'], format='%m-%d-%Y %H:%M', utc=True)
+    df_poly['timestamp'] = pd.to_datetime(df_poly['Date (UTC)'], format='%m-%d-%Y %H:%M', utc=True, errors='coerce')
     df_poly['unix_sec'] = df_poly['Timestamp (UTC)'].astype(float)
     df_poly = df_poly.sort_values('unix_sec')
-    strikes = [float(col.replace('k', '000')) for col in df_poly.columns if col.endswith('k')]
-    poly_end_ts = df_poly['unix_sec'].max()
+    strikes = sorted(strike_columns.keys())
     expiry_dt = infer_poly_expiry(poly_csv_path, df_poly)
-    expiry_ts = expiry_dt.timestamp()
     expiry_str = find_nearest_deribit_expiry(asset, expiry_dt)
+    if not expiry_str:
+        logger.error(f"Failed to find a valid Deribit expiry for {asset}")
+        return
+    expiry_dt_deribit = datetime.strptime(expiry_str.upper(), '%d%b%y').replace(hour=DERIBIT_EXPIRY_HOUR_UTC, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+    expiry_ts = expiry_dt_deribit.timestamp()
     start_ms = int(df_poly['unix_sec'].min() * 1000)
-    end_ms = int(poly_end_ts * 1000) + 3600 * 1000
+    end_ms = int(expiry_ts * 1000)
     df_underlying = fetch_underlying_historical(asset, start_ms - 86400 * 1000, end_ms)
     if df_underlying.empty:
-        logger.error("No underlying data available, exiting")
+        logger.error(f"No underlying data available for {asset}, exiting")
         return
-    spot_median = df_underlying['close'].median()
     strike_to_instr = get_deribit_strikes(asset, expiry_str)
+    if not strike_to_instr:
+        logger.error(f"No instruments found for {asset} with expiry {expiry_str}")
+        return
     results = {}
     for strike in strikes:
-        result = process_strike(strike, df_poly, expiry_ts, strike_to_instr, start_ms, end_ms, poly_end_ts, spot_median, min_trades, trade_dir)
+        result = process_strike(strike, df_poly, expiry_ts, strike_to_instr, start_ms, end_ms, min_trades, trade_dir, strike_columns, expiry_dt_deribit, df_underlying)
         if result is not None:
             df_merged = result
+            df_merged = df_merged.dropna(subset=['poly_prob'])
+            if len(df_merged) < MIN_DATA_POINTS:
+                logger.warning(f"Insufficient merged data points ({len(df_merged)}) for strike {strike}, skipping save and plot")
+                continue
             results[strike] = df_merged
-            # Check for early resolution
-            resolution_idx = df_merged['poly_prob'].eq(0).idxmax() if df_merged['poly_prob'].eq(0).any() else None
-            if resolution_idx is not None and resolution_idx > 0:
-                resolution_ts = df_merged.loc[resolution_idx, 'unix_sec']
-                df_merged = df_merged[df_merged['unix_sec'] <= resolution_ts]
-                logger.info(f"Early resolution detected for strike {strike} at {df_merged.loc[resolution_idx, 'timestamp']}")
-            # Per-strike plot
+            # Check for resolution (above 99% threshold)
+            resolution_mask = df_merged['poly_prob'] >= RESOLUTION_THRESHOLD
+            if resolution_mask.any():
+                resolution_idx = resolution_mask.idxmax()
+                if resolution_idx > 0:  # Only if resolution happens after data starts
+                    resolution_ts = df_merged.loc[resolution_idx, 'unix_sec']
+                    df_merged = df_merged[df_merged['unix_sec'] <= resolution_ts]
+                    logger.info(f"Resolution detected for strike {strike} at {df_merged.loc[resolution_idx, 'timestamp']}. Data points after filter: {len(df_merged)}")
+            if len(df_merged) < MIN_DATA_POINTS:
+                logger.warning(f"Insufficient data points ({len(df_merged)}) for strike {strike} after resolution, skipping save and plot")
+                continue
             plt.figure(figsize=(12, 6))
             plt.plot(df_merged['timestamp'], df_merged['poly_prob'], label='Polymarket Prob')
             plt.plot(df_merged['timestamp'], df_merged['barrier_prob'], label='Deribit Barrier Hit Prob')
-            plt.title(f'Barrier Hit Probability Comparison: {asset} ${int(strike/1000)}k')
+            plt.title(f'Barrier Hit Probability Comparison: {asset} ${int(strike)}')
             plt.xlabel('Time')
             plt.ylabel('Probability')
             plt.legend()
-            plt.savefig(os.path.join(chart_dir, f'barrier_prob_comparison_{int(strike/1000)}k.png'))
+            plt.savefig(os.path.join(chart_dir, f'barrier_prob_comparison_{int(strike)}.png'))
             plt.close()
-            # Save merged data
-            df_merged.to_csv(os.path.join(prob_dir, f'barrier_prob_data_{int(strike/1000)}k.csv'), index=False)
+            df_merged.to_csv(os.path.join(prob_dir, f'barrier_prob_data_{int(strike)}.csv'), index=False)
+            logger.info(f"Saved CSV and plot for strike {strike} with {len(df_merged)} data points")
     if not results:
         logger.error("No valid results for any strikes")
         return
-    # All strikes plot
     plt.figure(figsize=(12, 6))
     for strike, df_merged in results.items():
-        plt.plot(df_merged['timestamp'], df_merged['poly_prob'], label=f'Poly {int(strike/1000)}k', alpha=0.7)
-        plt.plot(df_merged['timestamp'], df_merged['barrier_prob'], label=f'Deribit {int(strike/1000)}k', linestyle='--', alpha=0.7)
+        plt.plot(df_merged['timestamp'], df_merged['poly_prob'], label=f'Poly {int(strike)}', alpha=0.7)
+        plt.plot(df_merged['timestamp'], df_merged['barrier_prob'], label=f'Deribit {int(strike)}', linestyle='--', alpha=0.7)
     plt.title(f'All Strikes Barrier Hit Probability Comparison: {asset}')
     plt.xlabel('Time')
     plt.ylabel('Probability')
     plt.legend()
     plt.savefig(os.path.join(chart_dir, f'all_strikes_barrier_comparison.png'))
     plt.close()
-    # Cumulative divergence plot
     cum_div = pd.DataFrame()
+    max_len = max(len(df) for df in results.values())
     for strike, df_merged in results.items():
-        cum_div[f'{int(strike/1000)}k'] = df_merged['divergence'].abs()
+        div_series = df_merged['divergence'].abs().reindex(range(max_len)).ffill().bfill()
+        cum_div[f'{int(strike)}'] = div_series
     cum_div['total'] = cum_div.sum(axis=1)
-    cum_div['timestamp'] = next(iter(results.values()))['timestamp']
+    longest_df = max(results.values(), key=len)
+    cum_div['timestamp'] = longest_df['timestamp'].reindex(range(max_len)).ffill().bfill()
     plt.figure(figsize=(12, 6))
     plt.plot(cum_div['timestamp'], cum_div['total'], label='Cumulative Divergence')
     plt.title(f'Cumulative Divergence Across All Strikes: {asset}')
@@ -367,4 +544,8 @@ def main(asset='BTC', min_trades=MIN_TRADES):
     logger.info(f"Results saved to {asset_dir}")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Barrier Probability Comparator')
+    parser.add_argument('--asset', type=str, default='BTC', help='Default asset if not inferred from CSV filename (default: BTC)')
+    parser.add_argument('--min_trades', type=int, default=20, help='Minimum number of trades required for Deribit data')
+    args = parser.parse_args()
+    main(asset=args.asset, min_trades=args.min_trades)
